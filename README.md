@@ -21,6 +21,7 @@
 - 支持 `POST /redact`：复用校时输入与逐字时间轴，对修订文本做敏感词精确命中脱敏（等长 █ 遮蔽），并给出扩展 padding、裁剪到录音边界后的音频静音毫秒区间。
 - 支持 `POST /clip-plan`：复用校时输入与逐字时间轴，把修订稿上选中的 1～20 个非空字符区间映射为源录音裁剪与成片拼接方案（扩展留白、裁剪边界、合并重叠/相接片段，避免声音重复）。
 - 支持 `POST /coverage-gaps`：复用校时输入与逐字时间轴，把识别字符的半开毫秒区间视为覆盖，求录音 `[0,total_duration)` 内的覆盖缺口（仅输出时长不少于 `min_gap_ms` 者），并给出两侧最近 matched 修订字符下标与缺口内的连续 computed 字符段，便于听审区分未识别音频与插值文字。
+- 支持 `POST /review-clips`：复用校时输入与逐字时间轴，把修订稿中 `source=computed` 或替换纠错（matched 但字符不同）的连续字符合成风险块，按覆盖风险字符数最大化、播放总时长最短、区间序列字典序最小选出至多 `max_clips` 个互不重叠的听审音频片段（含两侧留白与录音边界裁剪）。
 - 提供 `/health` 健康检查。
 - 对齐内核为 **C（ctypes 调用）**，无编译器时自动回退**纯 Python** 实现，二者算法一致。
 
@@ -47,6 +48,7 @@ docker compose up --build -d
 - 敏感词脱敏接口：`POST http://localhost:8000/redact`
 - 成片剪辑规划接口：`POST http://localhost:8000/clip-plan`
 - 覆盖缺口审计接口：`POST http://localhost:8000/coverage-gaps`
+- 风险听审片段接口：`POST http://localhost:8000/review-clips`
 - 交互式文档：`http://localhost:8000/docs`（OpenAPI：`/openapi.json`）
 
 停止：
@@ -858,6 +860,80 @@ curl -X POST http://localhost:8000/coverage-gaps \
 `[300,600]`，恰好落在第二个缺口内，故该缺口带 `computed_spans` `[2,3)`；
 首尾缺口外侧没有 matched 修订字符，对应侧为 `null`。
 
+### `POST /review-clips`
+
+在执行与 `/align` 完全相同的输入校验和逐字校时后，从修订稿中找出需要人工
+**听审复核**的字符：`source=computed`（人工新增，时间为推算）或
+`source=matched` 但修订字符与识别字符不同（**替换纠错**）；其余完全匹配的
+字符不是风险字符。处理流程：
+
+1. 沿修订文本顺序，把**连续的风险字符**合并成一个**风险块**（安全字符会切断
+   风险块）；
+2. 每个风险块的音频区间取**首字 `start` 到末字 `end`**，向**两侧各扩展**
+   `padding_ms`，并**裁剪到录音边界** `[0, total_duration]`（允许零时长片段）；
+3. 从全部风险块中选择**至多 `max_clips` 个互不重叠**的片段（半开区间
+   **端点相接合法**），目标依次为：
+   1. **覆盖的风险字符总数最大**（一个片段恰好覆盖其风险块内的风险字符）；
+   2. 同分则**播放总时长最短**（各片段 `end - start` 之和最小）；
+   3. 仍同分则取**按起点排序的区间序列字典序最小**的方案（逐位比较
+      `(start, end)`）。
+
+请求体包含 `/align` 的全部字段，另加：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `max_clips` | 整数 | 最多选择的互不重叠片段数，允许 `1～20` |
+| `padding_ms` | 整数 | 每个风险块音频区间向两侧扩展的毫秒数，允许 `0～2000` |
+
+示例（“呀”“耍”为新增 computed、“嘛”替换识别字“吗”，各成风险块；扩 50ms、
+最多选 3 段，三段互不重叠故全部返回）：
+
+```bash
+curl -X POST http://localhost:8000/review-clips \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "recognized": [
+      {"char":"你","start":0,"end":100},
+      {"char":"好","start":200,"end":300},
+      {"char":"世","start":500,"end":600},
+      {"char":"界","start":600,"end":700},
+      {"char":"再","start":800,"end":900},
+      {"char":"见","start":900,"end":1000},
+      {"char":"吗","start":1000,"end":1100}
+    ],
+    "total_duration": 1200,
+    "revised_text": "你好呀世界耍再见嘛",
+    "max_clips": 3,
+    "padding_ms": 50
+  }'
+```
+
+响应：
+
+```json
+[
+  {"start": 250, "end": 550, "start_index": 2, "end_index": 3, "risk_count": 1},
+  {"start": 650, "end": 850, "start_index": 5, "end_index": 6, "risk_count": 1},
+  {"start": 950, "end": 1150, "start_index": 8, "end_index": 9, "risk_count": 1}
+]
+```
+
+字段说明：
+
+- 按**时间顺序**（即修订稿顺序）返回选中的片段；没有任何风险字符时返回 `[]`。
+- `start` / `end`：片段在录音中的**半开毫秒区间**（`end` 不含），已扩展留白并
+  裁剪到 `[0, total_duration]`。
+- `start_index` / `end_index`：对应风险块在 `revised_text` 中的**半开字符下标**
+  （`end_index` 不含）；`risk_count` 为该风险块（即该片段覆盖）的风险字符数。
+- 上例“呀”的推算区间为 `[300,500]`，扩 50ms 得 `[250,550]`；“耍”的推算区间为
+  `[700,800]`，扩 50ms 得 `[650,850]`；“嘛”替换“吗”，区间 `[1000,1100]`
+  扩 50ms 得 `[950,1150]`。
+- 若 `max_clips` 较小或留白使片段互相重叠，接口只返回按上述目标选出的子集。
+  例如把 `max_clips` 改为 `2`，由于三段互不重叠且各覆盖 1 个风险字符，会放弃
+  时长最长（300ms）的第一段，返回“耍”“嘛”两段（各 200ms）；若把
+  `padding_ms` 增大到使两个风险块的音频区间重叠，则二者不能同时入选
+  （端点恰好相接仍可同时入选）。
+
 ### 输入校验（HTTP 422）
 
 例如 `end < start`：
@@ -879,7 +955,8 @@ curl -X POST http://localhost:8000/coverage-gaps \
 不在 1～50、敏感词为空或重复、`padding_ms` 不在 0～1000，以及 `/clip-plan`
 的选择区间数量不在 1～20、区间为空/为负/越出修订稿、未按修订稿顺序排列或
 互相重叠、映射后为零时长区间、`padding_ms` 不在 0～2000，以及
-`/coverage-gaps` 的 `min_gap_ms` 缺失、非整数或不为正整数等。
+`/coverage-gaps` 的 `min_gap_ms` 缺失、非整数或不为正整数，以及
+`/review-clips` 的 `max_clips` 不在 1～20、`padding_ms` 不在 0～2000 等。
 
 ---
 
@@ -938,6 +1015,7 @@ app/
   redact.py          敏感词脱敏（精确命中合并、等长 █ 遮蔽与静音毫秒区间生成）
   clip_plan.py       成片剪辑规划（字符区间映射、留白扩展/裁剪、源录音区间合并与成片拼接）
   coverage.py        录音覆盖缺口审计（识别覆盖互补、两侧 matched 定位与缺口内 computed 段归集）
+  review_clips.py    风险听审片段（风险字符聚块、留白扩展/裁剪、带数量上限的加权区间调度）
   alignment.py       内核加载（C → 即时编译 → 纯 Python）
   align_py.py        纯 Python 后备内核
   native/align_c.c   C 对齐内核源码
