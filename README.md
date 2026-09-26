@@ -21,6 +21,7 @@
 - 支持 `POST /redact`：复用校时输入与逐字时间轴，对修订文本做敏感词精确命中脱敏（等长 █ 遮蔽），并给出扩展 padding、裁剪到录音边界后的音频静音毫秒区间。
 - 支持 `POST /clip-plan`：复用校时输入与逐字时间轴，把修订稿上选中的 1～20 个非空字符区间映射为源录音裁剪与成片拼接方案（扩展留白、裁剪边界、合并重叠/相接片段，避免声音重复）。
 - 支持 `POST /coverage-gaps`：复用校时输入与逐字时间轴，把识别字符的半开毫秒区间视为覆盖，求录音 `[0,total_duration)` 内的覆盖缺口（仅输出时长不少于 `min_gap_ms` 者），并给出两侧最近 matched 修订字符下标与缺口内的连续 computed 字符段，便于听审区分未识别音频与插值文字。
+- 支持 `POST /review-clips`：复用校时输入与逐字时间轴，把新增（computed）与替换纠错（matched 但字符不同）的连续风险字符合成风险块，扩展 `padding_ms` 并裁剪到录音范围后，选择至多 `max_clips` 个互不重叠、覆盖风险字符最多的听审片段（并列时播放总时长更短、按起点排序的区间序列字典序更小者优先）。
 - 提供 `/health` 健康检查。
 - 对齐内核为 **C（ctypes 调用）**，无编译器时自动回退**纯 Python** 实现，二者算法一致。
 
@@ -47,6 +48,7 @@ docker compose up --build -d
 - 敏感词脱敏接口：`POST http://localhost:8000/redact`
 - 成片剪辑规划接口：`POST http://localhost:8000/clip-plan`
 - 覆盖缺口审计接口：`POST http://localhost:8000/coverage-gaps`
+- 风险复审片段接口：`POST http://localhost:8000/review-clips`
 - 交互式文档：`http://localhost:8000/docs`（OpenAPI：`/openapi.json`）
 
 停止：
@@ -858,6 +860,82 @@ curl -X POST http://localhost:8000/coverage-gaps \
 `[300,600]`，恰好落在第二个缺口内，故该缺口带 `computed_spans` `[2,3)`；
 首尾缺口外侧没有 matched 修订字符，对应侧为 `null`。
 
+### `POST /review-clips`
+
+在执行与 `/align` 完全相同的输入校验和逐字校时后，圈定修订稿中需要人工
+**听审复核的风险字符**，并从录音里选出覆盖风险最多的若干互不重叠片段，
+便于审核人集中回听 ASR 不可靠的位置。
+
+**风险字符**（满足任一）：
+
+- `source=computed` 的新增字符（识别稿中没有对应声音，时间为推算）；
+- `source=matched` 但修订字符与识别字符**不同**（人工替换纠错，原识别可能
+  听写错）。
+
+**风险块**：把修订稿中**连续的风险字符**合并为一块（正常匹配字符会截断）。
+每个风险块取**首字 `start` 到末字 `end`**，向两侧各扩展 `padding_ms` 并
+**裁剪到录音边界** `[0, total_duration]`，得到一个候选片段。
+
+请求体包含 `/align` 的全部字段，另加：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `max_clips` | 整数 | 最多选取的候选片段数，允许 `1～20` |
+| `padding_ms` | 整数 | 每个候选片段向两侧扩展的毫秒数，允许 `0～2000` |
+
+片段选择目标（依次）：
+
+1. **覆盖的风险字符总数最多**（选中片段对应风险块的长度之和最大；每个片段
+   只覆盖自身风险块的字符）；
+2. 并列时取**播放总时长更短**（各片段 `end - start` 之和最小）；
+3. 仍并列时，取**按起点排序的区间序列字典序更小**的方案（先比首段起点，
+   起点相同再比末点，依此类推）。
+
+候选片段按**半开毫秒区间**判互不重叠——**端点相接合法**（前一段 `end` 等于
+后一段 `start` 不算重叠）；结果至多包含 `max_clips` 段。**没有风险字符时
+返回 `[]`**。
+
+示例（修订稿“呀世”两字相邻：“呀”锚定识别“事”为替换纠错，“世”是相邻的
+新增字符，二者都是风险字符，合成一个风险块，扩 50ms 留白）：
+
+```bash
+curl -X POST http://localhost:8000/review-clips \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "recognized": [
+      {"char":"你","start":0,"end":100},
+      {"char":"好","start":100,"end":200},
+      {"char":"事","start":300,"end":400},
+      {"char":"界","start":450,"end":500}
+    ],
+    "total_duration": 600,
+    "revised_text": "你好呀世界",
+    "max_clips": 5,
+    "padding_ms": 50
+  }'
+```
+
+响应：
+
+```json
+[
+  {"start": 250, "end": 500, "start_index": 2, "end_index": 4, "risk_count": 2}
+]
+```
+
+字段说明：
+
+- 按**时间顺序**返回每个选中片段；无风险字符时为 `[]`。
+- `start` / `end`：该片段在录音中的半开毫秒区间（已扩展 `padding_ms` 并
+  裁剪到 `[0, total_duration]`）。
+- `start_index` / `end_index`：对应风险块在 `revised_text` 中的半开字符
+  下标（`end_index` 不含）。
+- `risk_count`：风险块包含的风险字符数（等于 `end_index - start_index`）。
+
+上例中风险块为修订稿下标 `[2,4)` 的“呀世”（2 个风险字符）：对齐时“呀”
+锚定识别“事”（替换）、“世”为其相邻新增字符，首字起点 300、末字终点 450，
+扩 50ms 得 `[250,500]`；正常匹配的“你”“好”“界”不是风险字符。
+
 ### 输入校验（HTTP 422）
 
 例如 `end < start`：
@@ -879,7 +957,9 @@ curl -X POST http://localhost:8000/coverage-gaps \
 不在 1～50、敏感词为空或重复、`padding_ms` 不在 0～1000，以及 `/clip-plan`
 的选择区间数量不在 1～20、区间为空/为负/越出修订稿、未按修订稿顺序排列或
 互相重叠、映射后为零时长区间、`padding_ms` 不在 0～2000，以及
-`/coverage-gaps` 的 `min_gap_ms` 缺失、非整数或不为正整数等。
+`/coverage-gaps` 的 `min_gap_ms` 缺失、非整数或不为正整数，以及
+`/review-clips` 的 `max_clips` 不在 1～20、`padding_ms` 不在 0～2000 或
+字段缺失/类型错误等。
 
 ---
 
@@ -938,6 +1018,7 @@ app/
   redact.py          敏感词脱敏（精确命中合并、等长 █ 遮蔽与静音毫秒区间生成）
   clip_plan.py       成片剪辑规划（字符区间映射、留白扩展/裁剪、源录音区间合并与成片拼接）
   coverage.py        录音覆盖缺口审计（识别覆盖互补、两侧 matched 定位与缺口内 computed 段归集）
+  review_clips.py    风险复审片段（新增/替换风险字符合块、留白扩展/裁剪与覆盖最多的互不重叠区间选择）
   alignment.py       内核加载（C → 即时编译 → 纯 Python）
   align_py.py        纯 Python 后备内核
   native/align_c.c   C 对齐内核源码

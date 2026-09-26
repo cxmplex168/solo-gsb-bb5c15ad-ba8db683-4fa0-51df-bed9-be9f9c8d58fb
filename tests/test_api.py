@@ -2339,3 +2339,210 @@ def test_coverage_gaps_extra_field_rejected(client):
         "min_gap_ms": 1, "bogus": 1})
     assert r.status_code == 422
     assert "不允许" in r.json()["detail"]
+
+# ---------------------------------------------------------------------------
+# 风险复审片段 POST /review-clips
+# ---------------------------------------------------------------------------
+def _review(client, items, revised, max_clips=20, padding_ms=0, total=1000):
+    payload = {
+        "recognized": rc(items),
+        "total_duration": total,
+        "revised_text": revised,
+        "max_clips": max_clips,
+        "padding_ms": padding_ms,
+    }
+    return client.post("/review-clips", json=payload)
+
+
+def test_review_clips_groups_computed_and_substituted_run(client):
+    # 对齐后“呀”锚定识别“事”（替换纠错，300～400）、“世”为相邻的新增
+    # （computed，落在 400～450 空档），两者都是风险字符且相邻，合成一个块
+    r = _review(client, [
+        ("你", 0, 100), ("好", 100, 200), ("事", 300, 400), ("界", 450, 500),
+    ], "你好呀世界", total=600)
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"start": 300, "end": 450, "start_index": 2, "end_index": 4,
+         "risk_count": 2}]
+
+
+def test_review_clips_padding_expands_and_clamps(client):
+    r = _review(client, [
+        ("你", 0, 100), ("好", 100, 200), ("事", 300, 400), ("界", 450, 500),
+    ], "你好呀世界", padding_ms=50, total=600)
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"start": 250, "end": 500, "start_index": 2, "end_index": 4,
+         "risk_count": 2}]
+
+
+def test_review_clips_clamps_to_recording_bounds(client):
+    # 首部连续 computed 块“ab”与末尾替换块“x（识别 y）”，中间用安全 matched
+    # “m”隔开；padding=100 后两块分别被裁剪到录音起点与终点。
+    r = _review(client, [
+        ("m", 300, 310), ("y", 500, 600),
+    ], "abmx", padding_ms=100, total=600)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body) == 2
+    assert body[0] == {
+        "start": 0, "end": 400, "start_index": 0, "end_index": 2,
+        "risk_count": 2}
+    assert body[1] == {
+        "start": 400, "end": 600, "start_index": 3, "end_index": 4,
+        "risk_count": 1}
+
+
+def test_review_clips_no_risk_returns_empty(client):
+    r = _review(client, [
+        ("你", 0, 100), ("好", 100, 200),
+    ], "你好", total=300)
+    assert r.status_code == 200, r.text
+    assert r.json() == []
+
+
+def test_review_clips_empty_text_returns_empty(client):
+    r = _review(client, [], "", total=0)
+    assert r.status_code == 200, r.text
+    assert r.json() == []
+
+
+def test_review_clips_max_clips_limits_and_picks_largest_coverage(client):
+    # 风险块：a(替换,1字) / bc(连续两个 computed,2字) / e(替换,1字)，
+    # 分别用安全 matched “x”“m”隔开
+    r = _review(client, [
+        ("z", 0, 100), ("x", 100, 200), ("m", 300, 310), ("w", 500, 600),
+    ], "axbcme", max_clips=1, padding_ms=0, total=700)
+    assert r.status_code == 200, r.text
+    # 对齐 [0,1,-1,-1,2,3]：a↔z（替换）、x 安全匹配、b/c 为新增（空档
+    # [200,300] 均分）、m 安全匹配、e↔w（替换）
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["risk_count"] == 2
+    assert (body[0]["start_index"], body[0]["end_index"]) == (2, 4)
+    assert (body[0]["start"], body[0]["end"]) == (200, 300)
+
+
+def test_review_clips_tiebreak_shorter_playback_duration(client):
+    # 两个互不重叠的替换风险块，时长 100 与 200；max_clips=1 取更短者
+    r = _review(client, [
+        ("z", 0, 100), ("o", 150, 250), ("w", 400, 600),
+    ], "aob", max_clips=1, padding_ms=0, total=700)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["start_index"] == 0  # “a”（0～100，100ms）
+    assert (body[0]["start"], body[0]["end"]) == (0, 100)
+
+
+def test_review_clips_tiebreak_lex_smallest_earliest(client):
+    # 三个同权重、同时长（100ms）、互不重叠的替换块 a/c/e，中间用安全匹配
+    # “b”“d”隔开；max_clips=2 时各方案覆盖与时长并列，取按起点排序字典序
+    # 最小（最早）的两个
+    r = _review(client, [
+        ("z", 0, 100), ("b", 200, 300), ("y", 400, 500),
+        ("d", 600, 700), ("x", 800, 900),
+    ], "abcde", max_clips=2, padding_ms=0, total=1000)
+    assert r.status_code == 200, r.text
+    assert [(c["start_index"], c["end_index"]) for c in r.json()] == [
+        (0, 1), (2, 3)]
+
+
+def test_review_clips_padding_makes_blocks_overlap(client):
+    # “呀”“呃”两个 computed 字符被安全匹配的“好”“界”隔开，各自成块；
+    # 大 padding 使两个候选区间重叠，max_clips=1 二选一，并列时取更早者
+    r = _review(client, [
+        ("好", 200, 300), ("界", 400, 500),
+    ], "呀好呃界", max_clips=1, padding_ms=100, total=600)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body) == 1
+    # “呀”推算 [0,200]（左界为录音起点 0），扩 100 仍裁剪起点 → [0,300]
+    assert body[0]["start_index"] == 0
+    assert (body[0]["start"], body[0]["end"]) == (0, 300)
+
+
+def test_review_clips_touching_intervals_are_compatible(client):
+    # 两个替换风险块 a/c 被安全匹配“b”隔开，映射后半开端点相接（不算重叠），
+    # 可同时选取
+    r = _review(client, [
+        ("z", 0, 100), ("b", 100, 200), ("y", 200, 300),
+    ], "abc", max_clips=2, padding_ms=0, total=400)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [(c["start"], c["end"]) for c in body] == [(0, 100), (200, 300)]
+    assert [(c["start_index"], c["end_index"]) for c in body] == [
+        (0, 1), (2, 3)]
+
+
+def test_review_clips_returns_time_order(client):
+    r = _review(client, [
+        ("z", 0, 100), ("m", 200, 210), ("w", 400, 500),
+    ], "amb", max_clips=20, padding_ms=0, total=600)
+    assert r.status_code == 200, r.text
+    starts = [c["start"] for c in r.json()]
+    assert starts == sorted(starts)
+    assert len(starts) == 2
+
+
+def test_review_clips_reuses_alignment_validation(client):
+    r = _review(client, [("a", 300, 100)], "a", total=500)
+    assert r.status_code == 422
+    assert "结束时间" in r.json()["detail"]
+
+
+def test_review_clips_max_clips_range(client):
+    payload = lambda k: {
+        "recognized": rc([("z", 0, 100)]), "total_duration": 200,
+        "revised_text": "a", "max_clips": k, "padding_ms": 0}
+    for bad in (0, 21):
+        r = client.post("/review-clips", json=payload(bad))
+        assert r.status_code == 422, (bad, r.text)
+        assert "1～20" in r.json()["detail"]
+    for good in (1, 20):
+        r = client.post("/review-clips", json=payload(good))
+        assert r.status_code == 200, (good, r.text)
+
+
+def test_review_clips_padding_ms_range(client):
+    payload = lambda p: {
+        "recognized": rc([("z", 0, 100)]), "total_duration": 200,
+        "revised_text": "a", "max_clips": 1, "padding_ms": p}
+    for bad in (-1, 2001):
+        r = client.post("/review-clips", json=payload(bad))
+        assert r.status_code == 422, (bad, r.text)
+        assert "0～2000" in r.json()["detail"]
+    for good in (0, 2000):
+        r = client.post("/review-clips", json=payload(good))
+        assert r.status_code == 200, (good, r.text)
+
+
+def test_review_clips_wrong_type(client):
+    r = client.post("/review-clips", json={
+        "recognized": rc([("z", 0, 100)]), "total_duration": 200,
+        "revised_text": "a", "max_clips": "3", "padding_ms": 0})
+    assert r.status_code == 422
+    assert "整数" in r.json()["detail"]
+    r = client.post("/review-clips", json={
+        "recognized": rc([("z", 0, 100)]), "total_duration": 200,
+        "revised_text": "a", "max_clips": 3, "padding_ms": None})
+    assert r.status_code == 422
+    assert "整数" in r.json()["detail"]
+
+
+def test_review_clips_missing_fields_rejected(client):
+    r = client.post("/review-clips", json={
+        "recognized": rc([("a", 0, 100)]), "total_duration": 200,
+        "revised_text": "a"})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert "max_clips" in detail
+    assert "padding_ms" in detail
+
+
+def test_review_clips_extra_field_rejected(client):
+    r = client.post("/review-clips", json={
+        "recognized": rc([("z", 0, 100)]), "total_duration": 200,
+        "revised_text": "a", "max_clips": 1, "padding_ms": 0, "bogus": 1})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]

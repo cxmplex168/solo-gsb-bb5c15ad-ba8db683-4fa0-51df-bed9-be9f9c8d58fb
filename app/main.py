@@ -33,6 +33,8 @@ from .schemas import (
     RedactRequest,
     RedactResponse,
     RetimeRequest,
+    ReviewClip,
+    ReviewClipsRequest,
     RevisionBlock,
     SpeakerBlock,
     SpeakerTurnsRequest,
@@ -40,6 +42,7 @@ from .schemas import (
 from .quote import find_quote_hits
 from .redact import build_redaction, validate_redact
 from .retime import apply_calibrations, validate_calibrations
+from .review_clips import build_review_clips
 from .revision import build_revision_diff
 from .speaker import build_speaker_blocks, validate_speaker_turns
 from .timeline import build_timeline, validate_request
@@ -80,7 +83,7 @@ async def invalid_timeline_handler(_request: Request,
 async def validation_handler(request: Request,
                              exc: RequestValidationError) -> JSONResponse:
     """把 Pydantic 校验错误转成明确的中文提示。"""
-    is_clip_plan = request.url.path == "/clip-plan"
+    wide_padding = request.url.path in ("/clip-plan", "/review-clips")
     messages = []
     for err in exc.errors():
         loc = ".".join(str(p) for p in err["loc"] if p != "body") or "请求体"
@@ -89,7 +92,7 @@ async def validation_handler(request: Request,
             messages.append(f"缺少必填字段：{loc}")
         elif etype in ("int_type", "int_parsing"):
             if loc.endswith(("max_edits", "max_chars", "padding_ms",
-                             "min_gap_ms")):
+                             "min_gap_ms", "max_clips")):
                 messages.append(f"字段 {loc} 必须是整数")
             elif loc.endswith(("start_index", "end_index")):
                 messages.append(f"字段 {loc} 必须是整数字符下标")
@@ -109,9 +112,11 @@ async def validation_handler(request: Request,
             elif loc.endswith("bucket_ms"):
                 range_hint = "，允许范围为 1000～60000"
             elif loc.endswith("padding_ms"):
-                range_hint = "，允许范围为 0～2000" if is_clip_plan else "，允许范围为 0～1000"
+                range_hint = "，允许范围为 0～2000" if wide_padding else "，允许范围为 0～1000"
             elif loc.endswith("min_gap_ms"):
                 range_hint = "，须为正整数"
+            elif loc.endswith("max_clips"):
+                range_hint = "，允许范围为 1～20"
             else:
                 range_hint = ""
             messages.append(f"字段 {loc} 无效{range_hint}")
@@ -300,3 +305,15 @@ async def coverage_gaps(req: CoverageGapsRequest) -> list[CoverageGap]:
     validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
     timeline = build_timeline(req, alignment.backend_name())
     return build_coverage_gaps(req, timeline["chars"])
+
+
+@app.post(
+    "/review-clips",
+    response_model=list[ReviewClip],
+    tags=["风险复审"],
+)
+async def review_clips(req: ReviewClipsRequest) -> list[ReviewClip]:
+    """圈定新增/替换风险字符，选出覆盖风险最多的互不重叠复审片段。"""
+    validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
+    timeline = build_timeline(req, alignment.backend_name())
+    return build_review_clips(req, timeline["chars"])

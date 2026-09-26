@@ -192,6 +192,19 @@ class CoverageGapsRequest(AlignRequest):
     )
 
 
+class ReviewClipsRequest(AlignRequest):
+    """校时输入与风险复审参数：最多选取的片段数与两侧留白。"""
+
+    max_clips: StrictInt = Field(
+        ..., ge=1, le=20,
+        description="最多选取的候选片段数（1～20）",
+    )
+    padding_ms: StrictInt = Field(
+        ..., ge=0, le=2000,
+        description="每个候选片段向两侧扩展的毫秒数（0～2000），扩展后裁剪到录音边界",
+    )
+
+
 class RevisedCharTimeline(BaseModel):
     char: str = Field(..., description="修订文本中的字符")
     start: int = Field(..., description="起始时间（毫秒）")
@@ -402,3 +415,18 @@ class CoverageGap(BaseModel):
     computed_spans: list[ComputedSpan] = Field(
         ..., description="时间与缺口相交的连续 computed 修订字符半开下标段，"
         "按原文顺序；没有则为空列表")
+
+
+class ReviewClip(BaseModel):
+    """单个风险复审片段：录音毫秒区间与对应的风险块字符区间。"""
+
+    start: int = Field(
+        ..., description="片段在录音中的起始毫秒（含），已扩展 padding 并裁剪到录音边界")
+    end: int = Field(
+        ..., description="片段在录音中的结束毫秒（不含），已扩展 padding 并裁剪到录音边界")
+    start_index: int = Field(
+        ..., description="风险块在修订文本中的起始字符下标（从 0 开始，半开区间）")
+    end_index: int = Field(
+        ..., description="风险块在修订文本中的结束字符下标（不含该位置）")
+    risk_count: int = Field(
+        ..., description="该风险块包含的风险字符数（等于 end_index - start_index）")
